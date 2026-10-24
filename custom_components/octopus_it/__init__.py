@@ -7,6 +7,7 @@ from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -17,11 +18,16 @@ from .const import (
     GET_PROPERTIES_QUERY,
     GET_METERS_QUERY,
     GET_SMART_USAGE_QUERY,
+    GET_GAS_SUPPLY_POINTS_QUERY,
+    GET_GAS_READINGS_QUERY,
     DEFAULT_SCAN_INTERVAL,
+    GAS_HISTORY_DAYS,
+    GAS_SCAN_INTERVAL,
     HISTORY_DAYS,
     SENSOR_TYPES, GET_ACCOUNT_LIST_QUERY,
     TIMEZONE,
 )
+from .gas import async_import_gas_statistics, parse_gas_readings
 from .statistics import async_import_statistics, parse_daily_readings
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,6 +58,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    async def import_gas(_now=None):
+        # Gas is optional, so a failure here must never affect the electricity sensors.
+        try:
+            await coordinator.async_import_gas_statistics()
+        except Exception:
+            _LOGGER.warning("Could not import gas readings", exc_info=True)
+
+    entry.async_create_background_task(hass, import_gas(), "octopus_it_gas_import")
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass, import_gas, timedelta(seconds=GAS_SCAN_INTERVAL)
+        )
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
     return True
@@ -84,6 +104,14 @@ class OctopusCoordinator(DataUpdateCoordinator):
         self._property_id = None
         self._market_supply_point_id = None
         self._timezone = None
+        self._gas_pdr = None
+
+    async def _async_get_timezone(self):
+        if self._timezone is None:
+            self._timezone = await self.hass.async_add_executor_job(
+                dt_util.get_time_zone, TIMEZONE
+            )
+        return self._timezone
 
     async def _async_get_token(self):
         """Obtain or refresh JWT token."""
@@ -208,10 +236,7 @@ class OctopusCoordinator(DataUpdateCoordinator):
         property_id = await self._async_get_property_id()
         msp_id = await self._async_get_market_supply_point()
 
-        if self._timezone is None:
-            self._timezone = await self.hass.async_add_executor_job(
-                dt_util.get_time_zone, TIMEZONE
-            )
+        await self._async_get_timezone()
 
         # Align the window to local midnights so every returned day is complete.
         today = datetime.now(self._timezone).replace(
@@ -274,3 +299,73 @@ class OctopusCoordinator(DataUpdateCoordinator):
             self.hass, self._account_number, data["readings"]
         )
         return data
+
+    async def _async_get_gas_pdr(self):
+        """Return the PDR of the gas supply point, or None if there is no gas supply."""
+        if self._gas_pdr:
+            return self._gas_pdr
+
+        import aiohttp
+
+        token = await self._async_get_token()
+        property_id = await self._async_get_property_id()
+        payload = {
+            "operationName": "GetGasSupplyPoints",
+            "variables": {"propertyId": property_id},
+            "query": GET_GAS_SUPPLY_POINTS_QUERY,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                API_BASE, json=payload, headers={"Authorization": token}
+            ) as resp:
+                if resp.status != 200:
+                    raise UpdateFailed(f"Failed to get gas supply points: HTTP {resp.status}")
+                data = await resp.json()
+
+        try:
+            points = data["data"]["property"]["gasSupplyPoints"]
+            smart = [p for p in points if p.get("isSmartMeter")]
+            chosen = (smart or points or [None])[0]
+            self._gas_pdr = chosen["pdr"] if chosen else None
+            return self._gas_pdr
+        except Exception as e:
+            raise UpdateFailed(f"Error parsing gas supply points: {e}")
+
+    async def async_import_gas_statistics(self):
+        """Import monthly gas readings as statistics; does nothing without a gas supply."""
+        import aiohttp
+        from datetime import datetime
+
+        pdr = await self._async_get_gas_pdr()
+        if pdr is None:
+            return
+
+        token = await self._async_get_token()
+        timezone = await self._async_get_timezone()
+        today = datetime.now(timezone).date()
+        payload = {
+            "operationName": "GetGasReadings",
+            "variables": {
+                "accountNumber": self._account_number,
+                "pdr": pdr,
+                "dateFrom": (today - timedelta(days=GAS_HISTORY_DAYS)).isoformat(),
+                "dateTo": today.isoformat(),
+            },
+            "query": GET_GAS_READINGS_QUERY,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                API_BASE, json=payload, headers={"Authorization": token}
+            ) as resp:
+                if resp.status != 200:
+                    raise UpdateFailed(f"Failed to get gas readings: HTTP {resp.status}")
+                data = await resp.json()
+
+        try:
+            readings = parse_gas_readings(data["data"]["gasMeterReadings"]["edges"])
+        except Exception as e:
+            raise UpdateFailed(f"Error parsing gas readings: {e}")
+
+        await async_import_gas_statistics(
+            self.hass, self._account_number, readings, timezone
+        )

@@ -6,6 +6,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.octopus_it.const import DOMAIN
 
+from .test_gas import node, read_gas_sums
 from .test_statistics import ACCOUNT, _read_sums, edge
 
 
@@ -32,6 +33,22 @@ def api_response(payload: dict) -> dict:
                     "electricitySupplyPoints": [
                         {"id": "1", "pod": "IT001E00000000", "isSmartMeter": True}
                     ]
+                }
+            }
+        }
+    if operation == "GetGasSupplyPoints":
+        return {
+            "data": {
+                "property": {
+                    "gasSupplyPoints": [{"pdr": "12345678901234", "isSmartMeter": True}]
+                }
+            }
+        }
+    if operation == "GetGasReadings":
+        return {
+            "data": {
+                "gasMeterReadings": {
+                    "edges": [node("2026-08-31", 100), node("2026-09-30", 108)]
                 }
             }
         }
@@ -77,7 +94,7 @@ async def test_config_entry_sets_up_sensors_and_statistics(
 
     with patch("aiohttp.ClientSession", side_effect=lambda *a, **k: fake_session()):
         assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+        await hass.async_block_till_done(wait_background_tasks=True)
 
     total = hass.states.get("sensor.octopus_it_daily_total")
     assert total.state == "3.0"
@@ -87,3 +104,28 @@ async def test_config_entry_sets_up_sensors_and_statistics(
 
     sums = await _read_sums(hass, "daily_total")
     assert [sums[start] for start in sorted(sums)] == [2.0, 5.0]
+    assert await read_gas_sums(hass) == [0.0, 8.0]
+
+
+async def test_a_gas_failure_does_not_affect_the_electricity_sensors(
+    recorder_mock, enable_custom_integrations, hass: HomeAssistant, caplog
+):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_EMAIL: "user@example.com", CONF_PASSWORD: "secret"},
+        options={CONF_SCAN_INTERVAL: 3600},
+    )
+    entry.add_to_hass(hass)
+
+    with (
+        patch("aiohttp.ClientSession", side_effect=lambda *a, **k: fake_session()),
+        patch(
+            "custom_components.octopus_it.OctopusCoordinator.async_import_gas_statistics",
+            side_effect=Exception("gas is down"),
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert hass.states.get("sensor.octopus_it_daily_total").state == "3.0"
+    assert "Could not import gas readings" in caplog.text

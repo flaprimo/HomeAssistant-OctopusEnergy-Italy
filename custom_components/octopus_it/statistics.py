@@ -79,20 +79,31 @@ def get_statistic_id(account_number: str, sensor_key: str) -> str:
     return f"{DOMAIN}:{slugify(account_number)}_{sensor_key}"
 
 
-def build_metadata(account_number: str, sensor_key: str) -> StatisticMetaData:
+def build_statistic_metadata(
+    statistic_id: str, name: str, unit: str, unit_class: str
+) -> StatisticMetaData:
     metadata = StatisticMetaData(
         has_sum=True,
-        name=f"Octopus IT {SENSOR_TYPES[sensor_key][0]}",
+        name=name,
         source=DOMAIN,
-        statistic_id=get_statistic_id(account_number, sensor_key),
-        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        statistic_id=statistic_id,
+        unit_of_measurement=unit,
     )
     if StatisticMeanType is None:
         metadata["has_mean"] = False
     else:
         metadata["mean_type"] = StatisticMeanType.NONE
-        metadata["unit_class"] = EnergyConverter.UNIT_CLASS
+        metadata["unit_class"] = unit_class
     return metadata
+
+
+def build_metadata(account_number: str, sensor_key: str) -> StatisticMetaData:
+    return build_statistic_metadata(
+        get_statistic_id(account_number, sensor_key),
+        f"Octopus IT {SENSOR_TYPES[sensor_key][0]}",
+        UnitOfEnergy.KILO_WATT_HOUR,
+        EnergyConverter.UNIT_CLASS,
+    )
 
 
 async def async_get_last_sum(
