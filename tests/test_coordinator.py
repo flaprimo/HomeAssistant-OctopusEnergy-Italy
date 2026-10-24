@@ -24,7 +24,7 @@ def fake_session(response: dict):
 def make_coordinator(hass: HomeAssistant) -> OctopusCoordinator:
     coordinator = OctopusCoordinator(hass, "user@example.com", "secret", 3600)
     coordinator._token = "token"
-    coordinator._token_expiry = 1
+    coordinator._token_expires_at = float("inf")
     coordinator._account_number = ACCOUNT
     coordinator._property_id = "property"
     coordinator._market_supply_point_id = "IT001E00000000"

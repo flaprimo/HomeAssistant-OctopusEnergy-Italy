@@ -1,4 +1,7 @@
+import base64
+import json
 import logging
+import time
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -22,6 +25,19 @@ from .const import (
 from .statistics import async_import_statistics, parse_daily_readings
 
 _LOGGER = logging.getLogger(__name__)
+
+TOKEN_EXPIRY_MARGIN = 60  # seconds before `exp` at which we stop using a token
+FALLBACK_TOKEN_LIFETIME = 30 * 60  # seconds, used if the token can't be decoded
+
+
+def token_expires_at(token: str) -> float:
+    """Return the time (unix seconds) at which a JWT should no longer be used."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return float(claims["exp"]) - TOKEN_EXPIRY_MARGIN
+    except (IndexError, KeyError, TypeError, ValueError):
+        return time.time() + FALLBACK_TOKEN_LIFETIME
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -63,7 +79,7 @@ class OctopusCoordinator(DataUpdateCoordinator):
         self._email = email
         self._password = password
         self._token = None
-        self._token_expiry = None
+        self._token_expires_at = 0.0
         self._account_number = None
         self._property_id = None
         self._market_supply_point_id = None
@@ -73,7 +89,7 @@ class OctopusCoordinator(DataUpdateCoordinator):
         """Obtain or refresh JWT token."""
         import aiohttp
 
-        if self._token and self._token_expiry:
+        if self._token and time.time() < self._token_expires_at:
             return self._token
 
         payload = {
@@ -89,7 +105,7 @@ class OctopusCoordinator(DataUpdateCoordinator):
         try:
             token_data = data["data"]["obtainKrakenToken"]
             self._token = token_data["token"]
-            self._token_expiry = token_data["refreshExpiresIn"]
+            self._token_expires_at = token_expires_at(self._token)
             self._account_number = await self._get_account_list()
             return self._token
         except Exception as e:
